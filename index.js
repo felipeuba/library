@@ -15,7 +15,6 @@ const express = require('express');
 const cors = require('cors');
 const { expressMiddleware } = require('@apollo/server/express4');
 
-app.use(express.static('dist'))
 
 const Book = require('./models/book');
 const Author = require('./models/author');
@@ -213,6 +212,9 @@ async function start() {
   await server.start();
 
   const app = express();
+
+  app.use(express.static('dist'))
+
   app.use(cors());
   app.use(express.json());
 
