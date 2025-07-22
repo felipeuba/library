@@ -201,8 +201,9 @@ async function start() {
     }
   }));
 
-  httpServer.listen(4000, () => {
-    console.log('🚀 Server running at http://localhost:4000/graphql');
+  const PORT = process.env.PORT || 4000;
+  httpServer.listen(PORT, () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}/graphql`);
   });
 }
 
