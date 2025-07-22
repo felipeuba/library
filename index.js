@@ -1,58 +1,41 @@
 const { ApolloServer } = require('@apollo/server');
 const { ApolloServerPluginLandingPageLocalDefault } = require('@apollo/server/plugin/landingPage/default');
 const { makeExecutableSchema } = require('@graphql-tools/schema');
-const { execute, subscribe } = require('graphql');
-const { SubscriptionServer } = require('subscriptions-transport-ws');
-const http = require('http');
+const { createServer } = require('http');
+const { WebSocketServer } = require('ws');
+const { useServer } = require('graphql-ws/lib/use/ws'); // ✅ usa subpath compatible con v5.5.5
 const gql = require('graphql-tag');
 const { GraphQLError } = require('graphql');
 const { PubSub } = require('graphql-subscriptions');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
 const { expressMiddleware } = require('@apollo/server/express4');
+require('dotenv').config();
 
-
+// Models
 const Book = require('./models/book');
 const Author = require('./models/author');
 const User = require('./models/user');
 
+// Init
+const pubsub = new PubSub();
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// DB
 mongoose.set('strictQuery', false);
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err.message));
 
-const pubsub = new PubSub();
-
+// TypeDefs
 const typeDefs = gql`
-  # (Tus typeDefs igual que antes)
   type Mutation {
-    addBook(
-      title: String!
-      published: Int!
-      author: String!
-      genres: [String!]!
-    ): Book!
-
-    editAuthor(
-      name: String!  
-      setBornTo: Int!
-    ): Author
-
-    createUser(
-      username: String!
-      favoriteGenre: String!
-    ): User
-
-    login(
-      username: String!
-      password: String!
-    ): Token
+    addBook(title: String!, published: Int!, author: String!, genres: [String!]!): Book!
+    editAuthor(name: String!, setBornTo: Int!): Author
+    createUser(username: String!, favoriteGenre: String!): User
+    login(username: String!, password: String!): Token
   }
 
   type Subscription {
@@ -93,13 +76,12 @@ const typeDefs = gql`
   }
 `;
 
+// Resolvers
 const resolvers = {
   Mutation: {
     addBook: async (root, args, context) => {
       if (!context.currentUser) {
-        throw new GraphQLError('not authenticated', {
-          extensions: { code: 'UNAUTHENTICATED' },
-        });
+        throw new GraphQLError('not authenticated', { extensions: { code: 'UNAUTHENTICATED' } });
       }
       let author = await Author.findOne({ name: args.author });
       if (!author) {
@@ -114,34 +96,22 @@ const resolvers = {
     },
 
     editAuthor: async (root, args, context) => {
-      if (!context.currentUser) {
-        throw new GraphQLError('not authenticated', {
-          extensions: { code: 'UNAUTHENTICATED' },
-        });
-      }
+      if (!context.currentUser) throw new GraphQLError('not authenticated', { extensions: { code: 'UNAUTHENTICATED' } });
       const author = await Author.findOne({ name: args.name });
       if (!author) return null;
       author.born = args.setBornTo;
       return author.save();
     },
 
-    createUser: async (root, args) => {
-      const user = new User({ ...args });
-      return user.save();
-    },
+    createUser: async (root, args) => new User({ ...args }).save(),
 
     login: async (root, args) => {
       const user = await User.findOne({ username: args.username });
       const passwordCorrect = args.password === 'secret';
       if (!user || !passwordCorrect) {
-        throw new GraphQLError('wrong credentials', {
-          extensions: { code: 'BAD_USER_INPUT' },
-        });
+        throw new GraphQLError('wrong credentials', { extensions: { code: 'BAD_USER_INPUT' } });
       }
-      const userForToken = {
-        username: user.username,
-        id: user._id,
-      };
+      const userForToken = { username: user.username, id: user._id };
       return { value: jwt.sign(userForToken, JWT_SECRET) };
     }
   },
@@ -154,8 +124,8 @@ const resolvers = {
 
   Query: {
     me: (root, args, context) => context.currentUser,
-    bookCount: async () => Book.countDocuments({}),
-    authorCount: async () => Author.countDocuments({}),
+    bookCount: () => Book.countDocuments(),
+    authorCount: () => Author.countDocuments(),
     allBooks: async (root, args) => {
       const filter = {};
       if (args.author) {
@@ -166,102 +136,70 @@ const resolvers = {
       if (args.genre) filter.genres = { $in: [args.genre] };
       return Book.find(filter).populate('author');
     },
-    allAuthors: async () => {
-      
-      return Author.aggregate([
-        {
-          $lookup: {
-            from: 'books',
-            localField: '_id',
-            foreignField: 'author',
-            as: 'books'
-          }
-        },
-        {
-          $addFields: {
-            bookCount: { $size: '$books' }
-          }
-        },
-        {
-          $project: {
-            books: 0
-          }
+    allAuthors: () => Author.aggregate([
+      {
+        $lookup: {
+          from: 'books',
+          localField: '_id',
+          foreignField: 'author',
+          as: 'books'
         }
-      ])
-    }
-  },
-
-  //reomve to avoid n+1 problem
-/*   Author: {
-    bookCount: async (root) => {
-      console.log('Resolviendo bookCount para', root.name)
-      return Book.countDocuments({ author: root._id })
-    }
-  } */
-
+      },
+      {
+        $addFields: { bookCount: { $size: '$books' } }
+      },
+      {
+        $project: { books: 0 }
+      }
+    ])
+  }
 };
 
+// Schema
 const schema = makeExecutableSchema({ typeDefs, resolvers });
 
-const server = new ApolloServer({
-  schema,
-  plugins: [ApolloServerPluginLandingPageLocalDefault()]
-});
-
+// Server start
 async function start() {
-  await server.start();
-
   const app = express();
+  const httpServer = createServer(app);
 
-  app.use(express.static('dist'))
+  const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
 
-  app.use(cors());
-  app.use(express.json());
+  useServer({
+    schema,
+    context: async (ctx) => {
+      const token = ctx.connectionParams?.authorization?.split(' ')[1];
+      if (token) {
+        const decodedToken = jwt.verify(token, JWT_SECRET);
+        const currentUser = await User.findById(decodedToken.id);
+        return { currentUser };
+      }
+      return {};
+    },
+  }, wsServer);
 
-  app.use('/graphql', (req, res, next) => {
-    if (req.body === undefined) {
-      req.body = {};
-    }
-    next();
+  const server = new ApolloServer({
+    schema,
+    plugins: [ApolloServerPluginLandingPageLocalDefault()],
   });
 
-  app.use(
-    '/graphql',
-    expressMiddleware(server, {
-      context: async ({ req }) => {
-        const auth = req.headers.authorization;
-        if (auth && auth.startsWith('Bearer ')) {
-          const decodedToken = jwt.verify(auth.substring(7), JWT_SECRET);
-          const currentUser = await User.findById(decodedToken.id);
-          return { currentUser };
-        }
-        return {};
+  await server.start();
+
+  app.use(cors());
+  app.use(express.static('dist'));
+  app.use(express.json());
+
+  app.use('/graphql', expressMiddleware(server, {
+    context: async ({ req }) => {
+      const auth = req.headers.authorization;
+      if (auth && auth.startsWith('Bearer ')) {
+        const decodedToken = jwt.verify(auth.substring(7), JWT_SECRET);
+        const currentUser = await User.findById(decodedToken.id);
+        return { currentUser };
       }
-    })
-  );
-
-  const httpServer = http.createServer(app);
-
-  SubscriptionServer.create(
-    {
-      schema,
-      execute,
-      subscribe,
-      onConnect: async (connectionParams) => {
-        if (connectionParams.authorization) {
-          const token = connectionParams.authorization.split(' ')[1];
-          const decodedToken = jwt.verify(token, JWT_SECRET);
-          const currentUser = await User.findById(decodedToken.id);
-          return { currentUser };
-        }
-        return {};
-      },
-    },
-    {
-      server: httpServer,
-      path: '/graphql',
+      return {};
     }
-  );
+  }));
 
   httpServer.listen(4000, () => {
     console.log('🚀 Server running at http://localhost:4000/graphql');
